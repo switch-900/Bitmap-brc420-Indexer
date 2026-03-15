@@ -10,6 +10,7 @@
  *   4. parcel genesis_height >= parent bitmap genesis_height
  *   5. Parent bitmap must exist in `bitmaps` table
  *   6. First-is-first dedup   (already enforced by UNIQUE index + upsert)
+ *   7. Provenance: parcel inscription must be a child of the bitmap inscription
  *
  * Usage:
  *   cd server && npx ts-node src/tools/validateParcels.ts
@@ -35,6 +36,7 @@ interface ParcelRow {
 
 interface BitmapRow {
   bitmap_number: number;
+  inscription_id: string;
   block_height: number;
 }
 
@@ -54,6 +56,30 @@ const fetchTxCount = async (blockHeight: number): Promise<number | null> => {
   return null;
 };
 
+/** Fetch all children inscription IDs for a parent inscription via /r/children pagination. */
+const fetchChildrenSet = async (parentInscriptionId: string): Promise<Set<string>> => {
+  const ids: string[] = [];
+  let page = 0;
+  while (true) {
+    const url = page === 0
+      ? `${ORD_API_URL}/r/children/${parentInscriptionId}`
+      : `${ORD_API_URL}/r/children/${parentInscriptionId}/${page}`;
+    const res = await axios.get(url, {
+      headers: { Accept: 'application/json,*/*' },
+      timeout: 15000,
+      responseType: 'json',
+      validateStatus: (s) => s >= 200 && s < 300,
+    });
+    const pageIds: string[] = Array.isArray((res.data as any)?.ids) ? (res.data as any).ids : [];
+    ids.push(...pageIds.map((s) => String(s).toLowerCase()));
+    const more = !!(res.data as any)?.more;
+    if (!more || pageIds.length === 0) break;
+    page++;
+    if (page > 2000) throw new Error('children pagination runaway');
+  }
+  return new Set(ids);
+};
+
 const main = async () => {
   if (DRY_RUN) logger.info('DRY RUN — no DB writes');
 
@@ -67,13 +93,13 @@ const main = async () => {
   );
   logger.info(`Loaded ${parcels.length} parcels across DB`);
 
-  // Load all bitmaps (bitmap_number → block_height)
-  const bitmapRows = await db.all<BitmapRow[]>('SELECT bitmap_number, block_height FROM bitmaps');
-  const bitmapHeightMap = new Map<number, number>();
+  // Load all bitmaps (bitmap_number → { inscription_id, block_height })
+  const bitmapRows = await db.all<BitmapRow[]>('SELECT bitmap_number, inscription_id, block_height FROM bitmaps');
+  const bitmapMap = new Map<number, { inscription_id: string; block_height: number }>();
   for (const b of bitmapRows) {
-    bitmapHeightMap.set(b.bitmap_number, b.block_height);
+    bitmapMap.set(b.bitmap_number, { inscription_id: b.inscription_id, block_height: b.block_height });
   }
-  logger.info(`Loaded ${bitmapRows.length} bitmaps for genesis-height lookup`);
+  logger.info(`Loaded ${bitmapRows.length} bitmaps for genesis-height + provenance lookup`);
 
   // Group parcels by bitmap_number so we only fetch txCount once per bitmap
   const byBitmap = new Map<number, ParcelRow[]>();
@@ -94,7 +120,9 @@ const main = async () => {
   for (let bi = 0; bi < bitmapNumbers.length; bi++) {
     const bm = bitmapNumbers[bi];
     const rows = byBitmap.get(bm)!;
-    const bitmapGenesisHeight = bitmapHeightMap.get(bm) ?? null;
+    const bitmapInfo = bitmapMap.get(bm) ?? null;
+    const bitmapGenesisHeight = bitmapInfo?.block_height ?? null;
+    const bitmapInscriptionId = bitmapInfo?.inscription_id ?? null;
 
     // Fetch txCount (skip for bitmap 0 per spec)
     let txCount: number | null = null;
@@ -104,6 +132,16 @@ const main = async () => {
       } else {
         txCount = await fetchTxCount(bm);
         txCountCache.set(bm, txCount);
+      }
+    }
+
+    // Fetch children set for provenance check (only if bitmap exists)
+    let childrenSet: Set<string> | null = null;
+    if (bitmapInscriptionId) {
+      try {
+        childrenSet = await fetchChildrenSet(bitmapInscriptionId);
+      } catch (err: any) {
+        logger.warn(`Failed to fetch children for bitmap ${bm} (${bitmapInscriptionId}): ${err?.message}`);
       }
     }
 
@@ -121,6 +159,10 @@ const main = async () => {
       // Rule 3: parcel_number < txCount (bitmap 0 exempt)
       else if (bm !== 0 && txCount !== null && p.parcel_number >= txCount) {
         reason = `parcel_number ${p.parcel_number} >= txCount ${txCount}`;
+      }
+      // Rule 7: provenance — must be child of bitmap inscription
+      else if (childrenSet && !childrenSet.has(p.inscription_id.toLowerCase())) {
+        reason = `not a child of bitmap ${bm} (${bitmapInscriptionId})`;
       }
 
       if (reason) {
