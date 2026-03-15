@@ -1,0 +1,35 @@
+[Unit]
+Description=Bitmap-brc420 indexer (API + block processing)
+After=network-online.target ord.service
+Wants=network-online.target ord.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Bitmap-brc420-Indexer/server
+
+Environment=NODE_ENV=production
+Environment=PORT=5000
+Environment=API_URL=http://127.0.0.1:4000
+Environment=BITCOIN_RPC_URL=http://127.0.0.1:8332
+Environment=BITCOIN_RPC_USER=switch9
+Environment=BITCOIN_RPC_PASS=blocksizematters
+Environment=WALLET_SYNC_BATCH_SIZE=2000
+Environment=WALLET_SYNC_TICK_MS=3000
+Environment=WALLET_SYNC_MAX_AGE_MS=7200000
+Environment=WALLET_SYNC_CONCURRENCY=32
+Environment=START_BLOCK=767430
+Environment=INSCRIPTION_CONCURRENCY=12
+EnvironmentFile=-%h/Bitmap-brc420-Indexer/server/.env
+
+# Wait briefly for ord to become reachable.
+ExecStartPre=/usr/bin/bash -lc 'for i in {1..60}; do curl -fsS -m 2 http://127.0.0.1:4000/r/blockheight >/dev/null && exit 0; sleep 1; done; echo "ord not reachable on 127.0.0.1:4000" >&2; exit 1'
+
+# Ensure TypeScript build exists, then run the compiled server.
+ExecStartPre=/usr/bin/npm run build
+ExecStart=/usr/bin/npm run start
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
